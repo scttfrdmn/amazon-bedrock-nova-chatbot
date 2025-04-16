@@ -1,176 +1,158 @@
 #!/usr/bin/env python3
-# Save this as chatbot.py in the project root directory
-
-import os
 import boto3
 import json
-from typing import List, Dict
+import os
 
-class NovaChatbot:
-    def __init__(self, model_id='us.amazon.nova-lite-v1:0', region_name='us-east-1'):
-        """
-        Initialize a chatbot using Amazon Bedrock Nova models.
+class BedrockChatbot:
+    """Simple chatbot using Amazon Bedrock models (Nova and Claude)."""
+    
+    # Available models with IDs
+    MODELS = {
+        # Amazon Nova models
+        "nova-micro": "us.amazon.nova-micro-v1:0",
+        "nova-lite": "us.amazon.nova-lite-v1:0",
+        "nova-pro": "us.amazon.nova-pro-v1:0",
         
-        Args:
-            model_id (str): ID of the Nova model to use.
-                Options: 'us.amazon.nova-micro-v1:0', 'us.amazon.nova-lite-v1:0', 'us.amazon.nova-pro-v1:0'
-            region_name (str): AWS region where Bedrock is available
-        """
-        # Initialize Bedrock runtime client
-        self.client = boto3.client(
-            service_name='bedrock-runtime',
-            region_name=region_name
-        )
-        self.model_id = model_id
+        # Anthropic Claude models
+        "claude-sonnet": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "claude-haiku": "anthropic.claude-3-5-haiku-20250219-v1:0"
+    }
+    
+    def __init__(self, model_key="nova-lite", region="us-east-1"):
+        """Initialize the chatbot with specified model."""
+        self.client = boto3.client("bedrock-runtime", region_name=region)
+        self.model_key = model_key
+        self.model_id = self.MODELS.get(model_key)
         self.messages = []
+        self.is_claude = "claude" in model_key
         
-        # Set up system prompt for the chatbot personality
+        # Set system prompt
         self.system = [{
-            "text": "You are a helpful AI assistant who provides clear, concise, and accurate information."
+            "text": "You are a helpful AI assistant who provides clear, concise information."
         }]
     
-    def add_message(self, message: str, role: str = "user") -> None:
-        """
-        Add a message to the conversation history.
-        
-        Args:
-            message (str): The message content
-            role (str): The role of the message sender ('user' or 'assistant')
-        """
+    def add_message(self, text, role="user"):
+        """Add a message to conversation history."""
         self.messages.append({
             "role": role,
-            "content": [{"text": message}]
+            "content": [{"text": text}]
         })
     
-    def get_response(self, message: str = None, inference_config: Dict = None) -> str:
-        """
-        Get a response from the Nova model based on conversation history.
-        
-        Args:
-            message (str, optional): New message to add before getting response
-            inference_config (Dict, optional): Configuration parameters for the model
-        
-        Returns:
-            str: The model's response text
-        """
-        # Add new message if provided
+    def get_response(self, message=None):
+        """Get response from the model based on conversation history."""
         if message:
             self.add_message(message)
         
-        # Use default inference parameters if none provided
-        if inference_config is None:
-            inference_config = {
+        try:
+            if self.is_claude:
+                return self._get_claude_response()
+            else:
+                return self._get_nova_response()
+        except Exception as e:
+            return f"Error: {str(e)}"
+    
+    def _get_nova_response(self):
+        """Get response from Nova models."""
+        response = self.client.converse(
+            modelId=self.model_id,
+            messages=self.messages,
+            system=self.system,
+            inferenceConfig={
                 "maxTokens": 512,
                 "temperature": 0.7,
                 "topP": 0.9
             }
+        )
         
-        try:
-            # Call the Bedrock Converse API
-            response = self.client.converse(
-                modelId=self.model_id,
-                messages=self.messages,
-                system=self.system,
-                inferenceConfig=inference_config
-            )
-            
-            # Extract the response text
-            response_text = response["output"]["message"]["content"][0]["text"]
-            
-            # Save the assistant's response in the conversation history
-            self.add_message(response_text, role="assistant")
-            
-            return response_text
-            
-        except Exception as e:
-            return f"Error: {str(e)}"
+        response_text = response["output"]["message"]["content"][0]["text"]
+        self.add_message(response_text, role="assistant")
+        return response_text
     
-    def clear_conversation(self) -> None:
+    def _get_claude_response(self):
+        """Get response from Claude models."""
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 512,
+            "temperature": 0.7,
+            "messages": self.messages,
+            "system": self.system[0]["text"]
+        })
+        
+        response = self.client.invoke_model(
+            modelId=self.model_id,
+            body=body
+        )
+        
+        response_body = json.loads(response.get("body").read())
+        response_text = response_body["content"][0]["text"]
+        self.add_message(response_text, role="assistant")
+        return response_text
+    
+    def clear_conversation(self):
         """Clear the conversation history."""
         self.messages = []
 
 
-def configure_aws_credentials():
-    """
-    Configure AWS credentials interactively if not already set.
-    Uses AWS CLI credentials if available.
-    """
-    # Create a boto3 client to test if credentials work
+def verify_credentials():
+    """Verify AWS credentials are available."""
     try:
-        # Create a test client to verify credentials
         sts = boto3.client('sts')
         identity = sts.get_caller_identity()
         print(f"Using AWS credentials for account: {identity['Account']}")
         return True
     except Exception as e:
-        print(f"Could not use existing AWS credentials: {e}")
-    
-    # If we get here, we couldn't find working credentials
-    print("AWS credentials not found or not working.")
-    aws_access_key = input("Enter your AWS Access Key ID: ")
-    aws_secret_key = input("Enter your AWS Secret Access Key: ")
-    aws_region = input("Enter your AWS Region (default: us-east-1): ") or "us-east-1"
-    
-    os.environ['AWS_ACCESS_KEY_ID'] = aws_access_key
-    os.environ['AWS_SECRET_ACCESS_KEY'] = aws_secret_key
-    os.environ['AWS_DEFAULT_REGION'] = aws_region
-    return True
+        print(f"Could not use AWS credentials: {e}")
+        return False
 
 
 def main():
-    """
-    Main function to run the chatbot interactively.
-    """
-    # Configure AWS credentials if needed
-    if not configure_aws_credentials():
-        print("Failed to configure AWS credentials. Exiting.")
+    """Run interactive chatbot."""
+    # Verify AWS credentials
+    if not verify_credentials():
+        print("Failed to verify AWS credentials. Exiting.")
         return
     
-    # Display available models
-    print("Available Nova models:")
-    print("1. Amazon Nova Micro (text-only, fastest responses)")
-    print("2. Amazon Nova Lite (multimodal, balanced speed/capability)")
-    print("3. Amazon Nova Pro (multimodal, most capable)")
+    # Display model options
+    print("\nAvailable models:")
+    print("1: Nova Micro - Amazon's fastest text-only model")
+    print("2: Nova Lite - Amazon's balanced multimodal model (default)")
+    print("3: Nova Pro - Amazon's most capable multimodal model")
+    print("4: Claude 3.7 Sonnet - Anthropic's advanced reasoning model")
+    print("5: Claude 3.5 Haiku - Anthropic's fast, efficient model")
     
     # Get model choice
-    choice = input("Select a model (1-3, default: 2): ") or "2"
-    
     model_map = {
-        "1": "us.amazon.nova-micro-v1:0",
-        "2": "us.amazon.nova-lite-v1:0", 
-        "3": "us.amazon.nova-pro-v1:0"
+        "1": "nova-micro",
+        "2": "nova-lite", 
+        "3": "nova-pro",
+        "4": "claude-sonnet",
+        "5": "claude-haiku"
     }
     
-    model_id = model_map.get(choice, "us.amazon.nova-lite-v1:0")
+    choice = input("\nSelect a model (1-5, default: 2): ") or "2"
+    model_key = model_map.get(choice, "nova-lite")
     
-    # Initialize the chatbot
-    chatbot = NovaChatbot(model_id=model_id)
+    # Initialize chatbot
+    chatbot = BedrockChatbot(model_key=model_key)
     
-    print(f"\nChatbot initialized with {model_id}")
-    print("Type 'quit', 'exit', or 'bye' to end the conversation.")
-    print("Type 'clear' to start a new conversation.")
+    print(f"\nChatbot initialized with {model_key}")
+    print("Type 'quit' to exit, 'clear' for new conversation")
     
-    # Main conversation loop
+    # Chat loop
     while True:
-        # Get user input
-        user_message = input("\nYou: ")
+        user_input = input("\nYou: ")
         
-        # Check exit conditions
-        if user_message.lower() in ['quit', 'exit', 'bye']:
-            print("Chatbot: Goodbye!")
+        if user_input.lower() in ['quit', 'exit', 'bye']:
+            print("Goodbye!")
             break
         
-        # Clear conversation if requested
-        if user_message.lower() == 'clear':
+        if user_input.lower() == 'clear':
             chatbot.clear_conversation()
-            print("Chatbot: Conversation cleared.")
+            print("Conversation cleared.")
             continue
         
-        # Get chatbot response
-        print("\nChatbot: ", end="")
-        
-        # Non-streaming response:
-        response = chatbot.get_response(user_message)
+        print("\nBot:", end=" ")
+        response = chatbot.get_response(user_input)
         print(response)
 
 
