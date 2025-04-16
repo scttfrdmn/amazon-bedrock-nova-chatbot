@@ -8,34 +8,20 @@ dist/
 build/
 *.egg-info/
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.coverage
-.coverage.*
-.cache
-coverage.xml
-*.cover
-.hypothesis/
-
-# Environments
-.env
-.venv
-env/
+# Virtual environments
 venv/
+env/
 ENV/
-env.bak/
-venv.bak/
 
-# IDE specific files
+# IDE files
 .idea/
 .vscode/
-*.swp
-*.swo
 
-# AWS credentials
+# Environment variables
+.env
+
+# AWS specific
 .aws/
-credentials.json
 
 # Logs
 *.log
