@@ -70,8 +70,8 @@ The chatbot uses the AWS SDK's default credential provider chain:
 Make the script executable and run it:
 
 ```bash
-chmod +x chatbot.py
-./chatbot.py
+chmod +x bedrock-chatbot.py
+./bedrock-chatbot.py
 ```
 
 Follow the prompts to:
