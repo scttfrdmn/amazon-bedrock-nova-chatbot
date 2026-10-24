@@ -1,32 +1,21 @@
-# Contributing to Amazon Bedrock Nova Chatbot
+# Contributing
 
-Thank you for your interest in contributing to this project! Here are some guidelines to help you get started.
+This project is a teaching demo, so the main rule is: **keep it easy to read.**
+A change that adds a feature but makes `chatbot.py` harder to follow is
+usually not worth it. A clearer comment or a better exercise usually is.
 
-## Development Setup
-
-1. Fork the repository
-2. Clone your fork locally
-3. Install dependencies: `pip install -r requirements.txt`
-4. Make your changes
-5. Test your changes
-6. Submit a pull request
-
-## Coding Standards
-
-- Follow PEP 8 guidelines
-- Include docstrings for functions and classes
-- Write meaningful commit messages
-
-## Testing
-
-Ensure all tests pass before submitting a pull request:
+## Setup
 
 ```bash
-pytest
+uv sync           # installs boto3 and pytest into .venv
+uv run pytest     # offline tests, no AWS calls
 ```
 
-## Pull Request Process
+## Guidelines
 
-1. Ensure your code passes all tests
-2. Update documentation as needed
-3. Submit your pull request with a clear description of the changes
+- Keep everything in `chatbot.py`, in its numbered sections.
+- Explain *why* in comments, not just *what*. Assume the reader is new to Bedrock.
+- If you change behaviour, update the README's "Things to try" and the tests.
+- Model IDs go out of date. When updating them, check the
+  [model catalog](https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html)
+  and run the chatbot against each model before opening a pull request.
