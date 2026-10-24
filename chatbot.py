@@ -1,178 +1,311 @@
 #!/usr/bin/env python3
-# Save this as chatbot.py in the project root directory
+"""
+A minimal command-line chatbot for Amazon Nova models on Amazon Bedrock.
 
-import os
-import boto3
+This file is meant to be read from top to bottom. Each numbered section
+introduces one idea you need to hold a conversation with a model on Bedrock:
+
+  1. Choosing a model        model IDs and inference profiles
+  2. Connecting to Bedrock   the bedrock-runtime client and credentials
+  3. The conversation        messages, roles, and why we keep history
+  4. Asking for a reply      the Converse API, streamed token by token
+  5. When things go wrong    turning AWS errors into useful hints
+  6. The chat loop           putting it all together
+
+Run it with:   uv run chatbot.py        (or: python chatbot.py)
+"""
+
+import argparse
 import json
-from typing import List, Dict
+import sys
 
-class NovaChatbot:
-    def __init__(self, model_id='us.amazon.nova-lite-v1:0', region_name='us-east-1'):
-        """
-        Initialize a chatbot using Amazon Bedrock Nova models.
-        
-        Args:
-            model_id (str): ID of the Nova model to use.
-                Options: 'us.amazon.nova-micro-v1:0', 'us.amazon.nova-lite-v1:0', 'us.amazon.nova-pro-v1:0'
-            region_name (str): AWS region where Bedrock is available
-        """
-        # Initialize Bedrock runtime client
-        self.client = boto3.client(
-            service_name='bedrock-runtime',
-            region_name=region_name
-        )
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
+
+# ---------------------------------------------------------------------------
+# 1. Choosing a model
+# ---------------------------------------------------------------------------
+# Every model on Bedrock has an ID, for example "amazon.nova-2-lite-v1:0".
+# Current models are usually called through an *inference profile*: the same
+# ID with a prefix that says where the request may be processed.
+#
+#   us.amazon.nova-2-lite-v1:0       -> processed in US regions only
+#   global.amazon.nova-2-lite-v1:0   -> processed in any region with capacity
+#
+# The model is identical either way; the prefix is about routing and data
+# residency. Nova 2 Lite offers "global.", so it works from any region. The
+# first-generation Nova models only have regional profiles: we use "us." here;
+# from Europe or Asia Pacific, use "eu." or "apac." instead.
+#
+# Other models work too. The Converse API (section 4) has the same request
+# shape for most chat models on Bedrock: Anthropic Claude, Meta Llama, Mistral
+# and more. Pass any model ID with --model, or switch mid-chat with /model:
+#
+#   uv run chatbot.py --model global.anthropic.claude-haiku-5-5
+#
+# Some providers ask for a one-time sign-up in the Bedrock console first.
+#
+# Models are retired over time. If an ID stops working, check
+# https://docs.aws.amazon.com/bedrock/latest/userguide/model-lifecycle.html
+
+MODELS = {
+    "lite": ("global.amazon.nova-2-lite-v1:0", "Nova 2 Lite: newest; text, images and video; can reason"),
+    "micro": ("us.amazon.nova-micro-v1:0", "Nova Micro: text only, fastest and cheapest"),
+    "pro": ("us.amazon.nova-pro-v1:0", "Nova Pro: first generation, most capable"),
+}
+DEFAULT_MODEL = "lite"
+
+# The system prompt sets the assistant's behaviour for the whole conversation.
+# Try changing it (or pass --system) and watch how the answers change.
+SYSTEM_PROMPT = "You are a helpful assistant. Keep answers clear and concise."
+
+# An upper limit on the length of each reply, measured in tokens (roughly
+# three-quarters of a word each). It caps cost and stops runaway answers.
+MAX_TOKENS = 2048
+
+
+def resolve_model(name):
+    """Turn a short name like "micro" into a model ID. Full IDs pass through."""
+    return MODELS[name][0] if name in MODELS else name
+
+
+# ---------------------------------------------------------------------------
+# 2. Connecting to Bedrock
+# ---------------------------------------------------------------------------
+# "bedrock-runtime" is the service that runs models. (Plain "bedrock" is a
+# separate service for managing them: listing models, fine-tuning, and so on.)
+#
+# We never handle credentials ourselves. boto3 looks for them automatically:
+#   - a Bedrock API key in the AWS_BEARER_TOKEN_BEDROCK environment variable
+#   - otherwise the usual AWS chain: environment variables, ~/.aws/ files
+#     (including `aws sso login`), or the role of the machine you're on.
+
+
+def make_client(region):
+    return boto3.client("bedrock-runtime", region_name=region)
+
+
+# ---------------------------------------------------------------------------
+# 3. The conversation
+# ---------------------------------------------------------------------------
+# The key idea: **the model remembers nothing between calls.** Each request
+# is independent. A chatbot "remembers" only because we send the whole
+# conversation so far, every single time.
+#
+# A conversation is a list of messages that alternate between "user" and
+# "assistant". Each message holds a list of content blocks; here they're all
+# text, but a block could also be an image or a document:
+#
+#   [{"role": "user",      "content": [{"text": "Hi! I'm Sam."}]},
+#    {"role": "assistant", "content": [{"text": "Hello Sam!"}]},
+#    {"role": "user",      "content": [{"text": "What's my name?"}]}]
+#
+# Type /history while chatting to see this list for your own conversation.
+
+
+class Chat:
+    def __init__(self, client, model_id, system_prompt=SYSTEM_PROMPT, think=None):
+        self.client = client
         self.model_id = model_id
+        self.system_prompt = system_prompt
+        self.think = think  # reasoning effort for Nova 2 Lite: None, "low" or "medium"
         self.messages = []
-        
-        # Set up system prompt for the chatbot personality
-        self.system = [{
-            "text": "You are a helpful AI assistant who provides clear, concise, and accurate information."
-        }]
-    
-    def add_message(self, message: str, role: str = "user") -> None:
+        self.usage = None  # token counts from the most recent reply
+
+    # -----------------------------------------------------------------------
+    # 4. Asking for a reply
+    # -----------------------------------------------------------------------
+    # The Converse API takes the same request shape for every model:
+    #   modelId          which model to ask
+    #   system           standing instructions (the system prompt)
+    #   messages         the conversation so far
+    #   inferenceConfig  generation settings: maxTokens, temperature, ...
+    #
+    # Anything specific to one model goes in additionalModelRequestFields.
+    # Nova 2 Lite can reason step by step before answering ("extended
+    # thinking"). It's off by default; --think turns it on. The reasoning
+    # itself is hidden (Bedrock returns it as "[REDACTED]"), but it is billed
+    # as output tokens, so watch the token count when you try it. (Some other
+    # models, such as recent Claude versions, reason by default.)
+    #
+    # We call converse_stream rather than converse so we can print the reply
+    # while it's being generated, instead of waiting for the whole thing.
+    # The stream is a sequence of events; the ones we care about are:
+    #   contentBlockDelta  a small piece of the reply
+    #   metadata           token usage, sent once at the end
+    #
+    # Reasoning arrives as separate "reasoningContent" deltas. We show only the
+    # answer, so with --think there's a pause before the first words appear.
+
+    def ask(self, text, on_text=lambda chunk: None):
+        """Send one user message and return the full reply.
+
+        on_text is called with each piece of text as it arrives.
         """
-        Add a message to the conversation history.
-        
-        Args:
-            message (str): The message content
-            role (str): The role of the message sender ('user' or 'assistant')
-        """
-        self.messages.append({
-            "role": role,
-            "content": [{"text": message}]
-        })
-    
-    def get_response(self, message: str = None, inference_config: Dict = None) -> str:
-        """
-        Get a response from the Nova model based on conversation history.
-        
-        Args:
-            message (str, optional): New message to add before getting response
-            inference_config (Dict, optional): Configuration parameters for the model
-        
-        Returns:
-            str: The model's response text
-        """
-        # Add new message if provided
-        if message:
-            self.add_message(message)
-        
-        # Use default inference parameters if none provided
-        if inference_config is None:
-            inference_config = {
-                "maxTokens": 512,
-                "temperature": 0.7,
-                "topP": 0.9
+        self.messages.append({"role": "user", "content": [{"text": text}]})
+        pieces = []
+        request = {
+            "modelId": self.model_id,
+            "system": [{"text": self.system_prompt}],
+            "messages": self.messages,
+            "inferenceConfig": {"maxTokens": MAX_TOKENS},
+        }
+        if self.think:
+            request["additionalModelRequestFields"] = {
+                "reasoningConfig": {"type": "enabled", "maxReasoningEffort": self.think}
             }
-        
         try:
-            # Call the Bedrock Converse API
-            response = self.client.converse(
-                modelId=self.model_id,
-                messages=self.messages,
-                system=self.system,
-                inferenceConfig=inference_config
-            )
-            
-            # Extract the response text
-            response_text = response["output"]["message"]["content"][0]["text"]
-            
-            # Save the assistant's response in the conversation history
-            self.add_message(response_text, role="assistant")
-            
-            return response_text
-            
-        except Exception as e:
-            return f"Error: {str(e)}"
-    
-    def clear_conversation(self) -> None:
-        """Clear the conversation history."""
+            response = self.client.converse_stream(**request)
+            for event in response["stream"]:
+                if "contentBlockDelta" in event:
+                    delta = event["contentBlockDelta"]["delta"]
+                    if "text" in delta:
+                        pieces.append(delta["text"])
+                        on_text(delta["text"])
+                elif "metadata" in event:
+                    self.usage = event["metadata"]["usage"]
+        except Exception:
+            # The request failed, so forget the message that caused it. That
+            # keeps user/assistant turns alternating, which the API requires.
+            self.messages.pop()
+            raise
+
+        reply = "".join(pieces)
+        if not reply:
+            # Nothing came back (for example, the token limit was used up on
+            # thinking). Drop the question too, for the same reason as above.
+            self.messages.pop()
+            return reply
+        # Save the reply so the model sees it next turn. This one line is
+        # what gives the chatbot its "memory".
+        self.messages.append({"role": "assistant", "content": [{"text": reply}]})
+        return reply
+
+    def clear(self):
         self.messages = []
 
 
-def configure_aws_credentials():
-    """
-    Configure AWS credentials interactively if not already set.
-    Uses AWS CLI credentials if available.
-    """
-    # Create a boto3 client to test if credentials work
-    try:
-        # Create a test client to verify credentials
-        sts = boto3.client('sts')
-        identity = sts.get_caller_identity()
-        print(f"Using AWS credentials for account: {identity['Account']}")
-        return True
-    except Exception as e:
-        print(f"Could not use existing AWS credentials: {e}")
-    
-    # If we get here, we couldn't find working credentials
-    print("AWS credentials not found or not working.")
-    aws_access_key = input("Enter your AWS Access Key ID: ")
-    aws_secret_key = input("Enter your AWS Secret Access Key: ")
-    aws_region = input("Enter your AWS Region (default: us-east-1): ") or "us-east-1"
-    
-    os.environ['AWS_ACCESS_KEY_ID'] = aws_access_key
-    os.environ['AWS_SECRET_ACCESS_KEY'] = aws_secret_key
-    os.environ['AWS_DEFAULT_REGION'] = aws_region
-    return True
+# ---------------------------------------------------------------------------
+# 5. When things go wrong
+# ---------------------------------------------------------------------------
+# AWS errors carry a code such as "AccessDeniedException". Mapping the common
+# ones to plain advice saves a lot of head-scratching in a live demo.
+
+HINTS = {
+    "AccessDeniedException": (
+        "Your credentials work but aren't allowed to use this model. Check that "
+        "your IAM policy allows bedrock:InvokeModelWithResponseStream. Some "
+        "non-Amazon models also need a one-time sign-up in the Bedrock console."
+    ),
+    "ValidationException": (
+        "Bedrock rejected the request. Often the model ID is mistyped, retired, "
+        "or not offered from this region (a \"us.\" ID won't work from Europe), "
+        "or the model doesn't support an option such as --think."
+    ),
+    "ResourceNotFoundException": (
+        "That model isn't available here. Try another model or --region."
+    ),
+    "ThrottlingException": "Too many requests right now. Wait a moment and retry.",
+    "UnrecognizedClientException": (
+        "AWS doesn't recognise these credentials. They may be expired; try "
+        "`aws sso login` or create a new Bedrock API key."
+    ),
+}
+
+
+def explain(error):
+    """Return a short, human-friendly explanation of an AWS error."""
+    if isinstance(error, NoCredentialsError):
+        return (
+            "No AWS credentials found. Set AWS_BEARER_TOKEN_BEDROCK to a Bedrock "
+            "API key, or run `aws configure` / `aws sso login`."
+        )
+    if isinstance(error, ClientError):
+        code = error.response["Error"]["Code"]
+        message = error.response["Error"].get("Message", "")
+        return f"{code}: {message}\n{HINTS.get(code, '')}".strip()
+    return f"{type(error).__name__}: {error}"
+
+
+# ---------------------------------------------------------------------------
+# 6. The chat loop
+# ---------------------------------------------------------------------------
+
+HELP = """Commands:
+  /model NAME   switch model and keep the conversation (try it!)
+  /history      show the raw messages that are sent to the model
+  /clear        start a new conversation
+  /quit         exit (Ctrl-D also works)"""
+
+
+def print_models():
+    for name, (model_id, description) in MODELS.items():
+        print(f"  {name:<10} {description}\n  {'':<10} {model_id}")
 
 
 def main():
-    """
-    Main function to run the chatbot interactively.
-    """
-    # Configure AWS credentials if needed
-    if not configure_aws_credentials():
-        print("Failed to configure AWS credentials. Exiting.")
+    parser = argparse.ArgumentParser(description="Chat with Amazon Nova on Amazon Bedrock.")
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help=f"short name ({', '.join(MODELS)}) or full model ID")
+    parser.add_argument("--region", default=boto3.Session().region_name or "us-east-1",
+                        help="AWS region to connect to (default: your AWS config, else us-east-1)")
+    parser.add_argument("--system", default=SYSTEM_PROMPT, help="system prompt")
+    parser.add_argument("--think", choices=["low", "medium"],
+                        help="turn on Nova 2 Lite's extended thinking at this effort")
+    parser.add_argument("--list", action="store_true", help="list the built-in models and exit")
+    args = parser.parse_args()
+
+    if args.list:
+        print_models()
         return
-    
-    # Display available models
-    print("Available Nova models:")
-    print("1. Amazon Nova Micro (text-only, fastest responses)")
-    print("2. Amazon Nova Lite (multimodal, balanced speed/capability)")
-    print("3. Amazon Nova Pro (multimodal, most capable)")
-    
-    # Get model choice
-    choice = input("Select a model (1-3, default: 2): ") or "2"
-    
-    model_map = {
-        "1": "us.amazon.nova-micro-v1:0",
-        "2": "us.amazon.nova-lite-v1:0", 
-        "3": "us.amazon.nova-pro-v1:0"
-    }
-    
-    model_id = model_map.get(choice, "us.amazon.nova-lite-v1:0")
-    
-    # Initialize the chatbot
-    chatbot = NovaChatbot(model_id=model_id)
-    
-    print(f"\nChatbot initialized with {model_id}")
-    print("Type 'quit', 'exit', or 'bye' to end the conversation.")
-    print("Type 'clear' to start a new conversation.")
-    
-    # Main conversation loop
+
+    chat = Chat(make_client(args.region), resolve_model(args.model), args.system, args.think)
+    print(f"Chatting with {chat.model_id} in {args.region}. Type /help for commands.")
+
     while True:
-        # Get user input
-        user_message = input("\nYou: ")
-        
-        # Check exit conditions
-        if user_message.lower() in ['quit', 'exit', 'bye']:
-            print("Chatbot: Goodbye!")
+        try:
+            text = input("\nYou: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
             break
-        
-        # Clear conversation if requested
-        if user_message.lower() == 'clear':
-            chatbot.clear_conversation()
-            print("Chatbot: Conversation cleared.")
+
+        if not text:
             continue
-        
-        # Get chatbot response
-        print("\nChatbot: ", end="")
-        
-        # Non-streaming response:
-        response = chatbot.get_response(user_message)
-        print(response)
+        if text in ("/quit", "/exit", "quit", "exit"):
+            break
+        if text == "/help":
+            print(HELP)
+            continue
+        if text == "/clear":
+            chat.clear()
+            print("Conversation cleared.")
+            continue
+        if text == "/history":
+            print(json.dumps(chat.messages, indent=2))
+            continue
+        if text.startswith("/model"):
+            name = text.removeprefix("/model").strip()
+            if not name:
+                print_models()
+            else:
+                # The history is plain data, so any model can pick it up.
+                chat.model_id = resolve_model(name)
+                print(f"Now using {chat.model_id}.")
+            continue
+
+        print("\nBot: ", end="", flush=True)
+        try:
+            chat.ask(text, on_text=lambda chunk: print(chunk, end="", flush=True))
+        except Exception as error:
+            print(f"\n[error] {explain(error)}")
+            continue
+
+        # Watch the input count grow each turn: that's the whole history
+        # being sent again. Tokens are what you're billed for.
+        if chat.usage:
+            print(f"\n  [{chat.usage['inputTokens']} tokens in, "
+                  f"{chat.usage['outputTokens']} out]")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
